@@ -437,7 +437,7 @@
 <body>
 
 <header>
-  <div class="wordmark">run<em>log</em></div>
+  <div class="wordmark">run<em>log</em> <span id="syncDot" style="font-size:9px; vertical-align:middle; color:var(--ink3);" title="sync status">●</span></div>
   <button class="key-btn" id="keyBtn" onclick="openModal()">api key</button>
 </header>
 
@@ -538,11 +538,60 @@
 </div><!-- /page -->
 
 <script>
+// ── AWS backend config ───────────────────────────────────
+// Update these after deploying the CloudFormation stack
+const AWS_CONFIG = {
+  API_URL: 'https://38uxlnyshl.execute-api.ap-southeast-2.amazonaws.com/prod',
+  API_KEY: '5lCHKgbcy27skTsp3yvCo8vDrBh6y5XB66OJyxJd'
+};
+const isAwsConfigured = () => !AWS_CONFIG.API_URL.includes('YOUR_API_ID');
+
+async function awsGetRuns() {
+  const r = await fetch(`${AWS_CONFIG.API_URL}/runs`, { headers: { 'x-api-key': AWS_CONFIG.API_KEY } });
+  if (!r.ok) throw new Error('AWS fetch failed');
+  return r.json();
+}
+
+async function awsPostRun(run) {
+  const r = await fetch(`${AWS_CONFIG.API_URL}/runs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': AWS_CONFIG.API_KEY },
+    body: JSON.stringify(run)
+  });
+  if (!r.ok) throw new Error('AWS save failed');
+  return r.json();
+}
+
+async function awsDeleteRun(id) {
+  await fetch(`${AWS_CONFIG.API_URL}/runs/${id}`, {
+    method: 'DELETE',
+    headers: { 'x-api-key': AWS_CONFIG.API_KEY }
+  });
+}
+
 const STORAGE_RUNS = 'runlog_runs_v1';
 const STORAGE_KEY  = 'runlog_apikey_v1';
 
 let runs  = JSON.parse(localStorage.getItem(STORAGE_RUNS) || '[]');
 let myChart = null;
+let syncStatus = 'local'; // 'local' | 'synced' | 'offline'
+
+// ── Boot: try loading from AWS, fall back to local ───────
+async function bootData() {
+  if (!isAwsConfigured()) { syncStatus = 'local'; return; }
+  try {
+    const cloudRuns = await awsGetRuns();
+    runs = cloudRuns.map(r => ({
+      id: r.id, date: r.date, distance: Number(r.distance),
+      duration: Number(r.duration), pace: r.pace, paceNum: Number(r.paceNum),
+      feel: r.feel, notes: r.notes || ''
+    }));
+    localStorage.setItem(STORAGE_RUNS, JSON.stringify(runs));
+    syncStatus = 'synced';
+  } catch (e) {
+    syncStatus = 'offline';
+  }
+}
 
 // ── Key management ──────────────────────────────────────
 const getKey  = () => localStorage.getItem(STORAGE_KEY) || '';
@@ -652,7 +701,7 @@ Run history:\n${history}`;
       const paceNum = parsed.duration_min / parsed.distance_km;
       const m = Math.floor(paceNum);
       const s = Math.round((paceNum - m) * 60).toString().padStart(2, '0');
-      runs.unshift({
+      const newRun = {
         id:       crypto.randomUUID(),
         date:     parsed.date,
         distance: parsed.distance_km,
@@ -661,7 +710,21 @@ Run history:\n${history}`;
         paceNum,
         feel:     parsed.feel,
         notes:    parsed.notes || ''
-      });
+      };
+
+      if (isAwsConfigured()) {
+        try {
+          const saved = await awsPostRun(newRun);
+          runs.unshift({ ...newRun, id: saved.id || newRun.id });
+          syncStatus = 'synced';
+        } catch (e) {
+          runs.unshift(newRun);
+          syncStatus = 'offline';
+        }
+      } else {
+        runs.unshift(newRun);
+      }
+
       localStorage.setItem(STORAGE_RUNS, JSON.stringify(runs));
       render();
     }
@@ -677,10 +740,11 @@ Run history:\n${history}`;
 }
 
 // ── Delete ──────────────────────────────────────────────
-function del(id) {
+async function del(id) {
   if (!confirm('Delete this run?')) return;
   runs = runs.filter(r => r.id !== id);
   localStorage.setItem(STORAGE_RUNS, JSON.stringify(runs));
+  if (isAwsConfigured()) { try { await awsDeleteRun(id); } catch (e) {} }
   render();
 }
 
@@ -781,8 +845,17 @@ function render() {
 }
 
 // ── Boot ────────────────────────────────────────────────
-updateKeyUI();
-render();
+async function boot() {
+  updateKeyUI();
+  await bootData();
+  const dot = document.getElementById('syncDot');
+  if (dot) {
+    dot.style.color = syncStatus === 'synced' ? '#1a7a4a' : syncStatus === 'offline' ? '#b83232' : '#a8a89f';
+    dot.title = syncStatus === 'synced' ? 'synced with AWS' : syncStatus === 'offline' ? 'offline — using local data' : 'local storage only';
+  }
+  render();
+}
+boot();
 </script>
 </body>
 </html>

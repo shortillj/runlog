@@ -323,6 +323,41 @@
     }
     .del:hover { color: var(--red); background: var(--red-bg); }
 
+    .row-actions { white-space: nowrap; text-align: right; }
+
+    .edit {
+      background: none; border: none;
+      color: var(--ink3); cursor: pointer;
+      font-size: 13px; padding: 3px 7px;
+      border-radius: 4px; line-height: 1;
+    }
+    .edit:hover { color: var(--green); background: var(--green-bg); }
+
+    /* Edit-modal form fields */
+    .field { margin-bottom: 12px; }
+    .field-label {
+      font-family: var(--mono);
+      font-size: 10px; font-weight: 500;
+      letter-spacing: 0.06em; color: var(--ink3);
+      text-transform: uppercase; margin-bottom: 5px;
+      display: block;
+    }
+    .field input, .field select, .field textarea {
+      width: 100%;
+      border: 1px solid var(--edge2);
+      border-radius: var(--radius);
+      padding: 9px 12px;
+      font-size: 13px;
+      font-family: var(--mono);
+      color: var(--ink);
+      background: var(--bg);
+      outline: none;
+    }
+    .field textarea { font-family: var(--sans); resize: vertical; min-height: 56px; }
+    .field input:focus, .field select:focus, .field textarea:focus { border-color: var(--green); }
+    .field-row { display: flex; gap: 10px; }
+    .field-row .field { flex: 1; }
+
     .empty {
       text-align: center;
       padding: 52px 20px;
@@ -457,6 +492,46 @@
   </div>
 </div>
 
+<!-- Edit run modal -->
+<div class="overlay" id="editOverlay" style="display:none;" onclick="editBgClose(event)">
+  <div class="modal">
+    <h2>Edit run</h2>
+    <input type="hidden" id="editId" />
+    <div class="field-row">
+      <div class="field">
+        <label class="field-label" for="editDate">date</label>
+        <input type="date" id="editDate" />
+      </div>
+      <div class="field">
+        <label class="field-label" for="editFeel">feel</label>
+        <select id="editFeel">
+          <option value="easy">easy</option>
+          <option value="ok">ok</option>
+          <option value="hard">hard</option>
+        </select>
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label class="field-label" for="editDistance">distance (km)</label>
+        <input type="number" id="editDistance" step="0.1" min="0.1" />
+      </div>
+      <div class="field">
+        <label class="field-label" for="editDuration">time (min)</label>
+        <input type="number" id="editDuration" step="0.1" min="0.1" />
+      </div>
+    </div>
+    <div class="field">
+      <label class="field-label" for="editNotes">notes</label>
+      <textarea id="editNotes"></textarea>
+    </div>
+    <div class="modal-row">
+      <button class="btn-cancel" onclick="closeEdit()">cancel</button>
+      <button class="btn-save" onclick="saveEdit()">save changes</button>
+    </div>
+  </div>
+</div>
+
 <div class="page">
 
   <!-- No key warning -->
@@ -490,7 +565,7 @@
     <div class="chat-log" id="chatLog">
       <div class="msg ai">
         <div class="av">🤖</div>
-        <div class="bubble">Hey James! Tell me about a run and I'll log it — something like <em>"8km this morning in 44 mins, felt strong"</em>. Or ask me anything about your stats.</div>
+        <div class="bubble">Hey James! Tell me about a run and I'll log it — something like <em>"8km this morning in 44 mins, felt strong"</em>. Ask me anything about your stats, or correct a run later by saying <em>"that 8k was actually 9k"</em>.</div>
       </div>
     </div>
     <div class="chat-bar">
@@ -573,6 +648,7 @@ const STORAGE_RUNS = 'runlog_runs_v1';
 const STORAGE_KEY  = 'runlog_apikey_v1';
 
 let runs  = JSON.parse(localStorage.getItem(STORAGE_RUNS) || '[]');
+let convo = []; // rolling chat history sent to Claude for follow-up context
 let myChart = null;
 let syncStatus = 'local'; // 'local' | 'synced' | 'offline'
 
@@ -655,17 +731,22 @@ async function send() {
   input.value   = '';
   btn.disabled  = true;
   addMsg('me', text);
+  convo.push({ role: 'user', content: text });
   showThinking();
 
   const today   = new Date().toISOString().split('T')[0];
   const history = runs.length
-    ? runs.map(r => `${r.date}: ${r.distance}km in ${r.duration}min, pace ${r.pace}, feel:${r.feel}`).join('\n')
+    ? runs.map(r => `[id:${r.id}] ${r.date}: ${r.distance}km in ${r.duration}min, pace ${r.pace}, feel:${r.feel}${r.notes ? ', note:' + r.notes : ''}`).join('\n')
     : 'No runs yet.';
 
   const system = `You are a friendly running coach for James. Always reply with a single JSON object — no markdown, no extra text.
 
-When the message describes a run:
+When the message describes a NEW run:
 {"action":"log","date":"YYYY-MM-DD","distance_km":8.5,"duration_min":42,"feel":"easy|ok|hard","notes":"One sentence. Mention conditions.","reply":"Short warm reply with pace included."}
+
+When the message asks to CHANGE or CORRECT an existing run (e.g. "that 8k was actually 9k", "make my last run's feel hard", "fix yesterday's time to 40 min"):
+{"action":"edit","id":"<copy the exact id from the run history below>","distance_km":9,"duration_min":42,"feel":"easy|ok|hard","notes":"...","reply":"Short confirmation of exactly what changed."}
+Only include the fields that change, but ALWAYS include the id copied verbatim from the run history. Use the conversation so far to resolve references like "that one" or "my last run".
 
 Otherwise (questions, chat):
 {"action":"chat","reply":"Your answer here, using run history if relevant."}
@@ -686,7 +767,7 @@ Run history:\n${history}`;
         model: 'claude-sonnet-4-5',
         max_tokens: 512,
         system,
-        messages: [{ role: 'user', content: text }]
+        messages: recentTurns()
       })
     });
 
@@ -698,15 +779,13 @@ Run history:\n${history}`;
     hideThinking();
 
     if (parsed.action === 'log') {
-      const paceNum = parsed.duration_min / parsed.distance_km;
-      const m = Math.floor(paceNum);
-      const s = Math.round((paceNum - m) * 60).toString().padStart(2, '0');
+      const { pace, paceNum } = computePace(parsed.duration_min, parsed.distance_km);
       const newRun = {
         id:       crypto.randomUUID(),
         date:     parsed.date,
         distance: parsed.distance_km,
         duration: parsed.duration_min,
-        pace:     `${m}:${s}`,
+        pace,
         paceNum,
         feel:     parsed.feel,
         notes:    parsed.notes || ''
@@ -727,16 +806,37 @@ Run history:\n${history}`;
 
       localStorage.setItem(STORAGE_RUNS, JSON.stringify(runs));
       render();
+    } else if (parsed.action === 'edit') {
+      await applyEdit(parsed.id, {
+        date:     parsed.date,
+        distance: parsed.distance_km,
+        duration: parsed.duration_min,
+        feel:     parsed.feel,
+        notes:    parsed.notes
+      });
     }
 
     addMsg('ai', parsed.reply || 'Got it!');
+    convo.push({ role: 'assistant', content: parsed.reply || 'Got it!' });
+    if (convo.length > 16) convo = convo.slice(-16);
 
   } catch (err) {
     hideThinking();
     addMsg('ai', `Something went wrong — ${err.message || 'check your API key and try again.'}`);
+    // keep the conversation window balanced so the next turn stays valid
+    convo.push({ role: 'assistant', content: 'Something went wrong on that one.' });
+    if (convo.length > 16) convo = convo.slice(-16);
   }
 
   btn.disabled = false;
+}
+
+// Return the last few turns, trimmed so the window always starts on a user turn
+// (the Messages API requires the first message to have role "user").
+function recentTurns() {
+  let w = convo.slice(-8);
+  while (w.length && w[0].role !== 'user') w = w.slice(1);
+  return w.length ? w : [{ role: 'user', content: convo[convo.length - 1].content }];
 }
 
 // ── Delete ──────────────────────────────────────────────
@@ -746,6 +846,91 @@ async function del(id) {
   localStorage.setItem(STORAGE_RUNS, JSON.stringify(runs));
   if (isAwsConfigured()) { try { await awsDeleteRun(id); } catch (e) {} }
   render();
+}
+
+// ── Pace helper (guards divide-by-zero) ─────────────────
+function computePace(durationMin, distanceKm) {
+  const dist = Number(distanceKm);
+  const dur  = Number(durationMin);
+  if (!dist || dist <= 0 || !dur || dur <= 0) return { pace: '—', paceNum: 0 };
+  const paceNum = dur / dist;
+  const m = Math.floor(paceNum);
+  const s = Math.round((paceNum - m) * 60).toString().padStart(2, '0');
+  return { pace: `${m}:${s}`, paceNum };
+}
+
+// ── Edit (shared by chat-edit and the edit modal) ───────
+// Backend has POST + DELETE only, so a remote edit = delete old + re-post.
+// Local state always updates first; remote is best-effort and falls back to offline.
+async function applyEdit(id, changes) {
+  const idx = runs.findIndex(r => r.id === id);
+  if (idx < 0) { addMsg('ai', "Couldn't find that run to edit — it may have been deleted."); return; }
+
+  const current = runs[idx];
+  const updated = {
+    ...current,
+    date:     changes.date     != null ? changes.date            : current.date,
+    distance: changes.distance != null ? Number(changes.distance): current.distance,
+    duration: changes.duration != null ? Number(changes.duration): current.duration,
+    feel:     changes.feel     != null ? changes.feel            : current.feel,
+    notes:    changes.notes    != null ? changes.notes           : current.notes
+  };
+  const { pace, paceNum } = computePace(updated.duration, updated.distance);
+  updated.pace = pace;
+  updated.paceNum = paceNum;
+
+  // update local immediately
+  runs[idx] = updated;
+  localStorage.setItem(STORAGE_RUNS, JSON.stringify(runs));
+
+  // best-effort remote sync: remove the old item, re-post the new one
+  if (isAwsConfigured()) {
+    try {
+      await awsDeleteRun(id);
+      const saved = await awsPostRun(updated);
+      runs[idx] = { ...updated, id: saved.id || updated.id };
+      localStorage.setItem(STORAGE_RUNS, JSON.stringify(runs));
+      syncStatus = 'synced';
+    } catch (e) {
+      syncStatus = 'offline';
+    }
+    const dot = document.getElementById('syncDot');
+    if (dot) {
+      dot.style.color = syncStatus === 'synced' ? '#1a7a4a' : '#b83232';
+      dot.title = syncStatus === 'synced' ? 'synced with AWS' : 'offline — using local data';
+    }
+  }
+  render();
+}
+
+// ── Edit modal ──────────────────────────────────────────
+function openEdit(id) {
+  const r = runs.find(x => x.id === id);
+  if (!r) return;
+  document.getElementById('editId').value       = r.id;
+  document.getElementById('editDate').value     = r.date;
+  document.getElementById('editDistance').value = r.distance;
+  document.getElementById('editDuration').value = r.duration;
+  document.getElementById('editFeel').value     = r.feel;
+  document.getElementById('editNotes').value    = r.notes || '';
+  document.getElementById('editOverlay').style.display = 'flex';
+}
+const closeEdit   = () => document.getElementById('editOverlay').style.display = 'none';
+const editBgClose = e => { if (e.target === document.getElementById('editOverlay')) closeEdit(); };
+
+async function saveEdit() {
+  const id = document.getElementById('editId').value;
+  const distance = parseFloat(document.getElementById('editDistance').value);
+  const duration = parseFloat(document.getElementById('editDuration').value);
+  if (!(distance > 0) || !(duration > 0)) { alert('Distance and time must both be greater than zero.'); return; }
+  closeEdit();
+  await applyEdit(id, {
+    date:     document.getElementById('editDate').value,
+    distance,
+    duration,
+    feel:     document.getElementById('editFeel').value,
+    notes:    document.getElementById('editNotes').value.trim()
+  });
 }
 
 // ── Render ──────────────────────────────────────────────
@@ -790,7 +975,7 @@ function render() {
         <td class="pace-cell">${r.pace} /km</td>
         <td><span class="badge ${r.feel}">${r.feel}</span></td>
         <td class="notes-cell" title="${r.notes}">${r.notes}</td>
-        <td><button class="del" onclick="del('${r.id}')" title="delete">×</button></td>`;
+        <td class="row-actions"><button class="edit" onclick="openEdit('${r.id}')" title="edit">✎</button><button class="del" onclick="del('${r.id}')" title="delete">×</button></td>`;
       body.appendChild(tr);
     });
   }
